@@ -119,6 +119,15 @@ footer { margin-top: 50px; font-size: 13.5px; color: var(--muted); border-top: 1
   </section>
 
   <section>
+    <h2>Does the deal bring shoppers in for other items?</h2>
+    <p class="sub">The usual defense of a losing deal is that it is a loss leader. To test it, each household's regular products are tracked, and weeks where more of them happen to be on deal are compared with that same household's other weeks. Next week's deals are a placebo and should show nothing.</p>
+    <div class="grid2">
+      <div class="panel"><h3>Effect of one more deal on a household's regular items</h3><p id="haloNote"></p><div class="chart" id="haloFx"></div></div>
+      <div class="panel"><h3>Deals that make money, with and without the halo</h3><p>Shaded band uses the low and high ends of the halo estimate</p><div class="chart" id="haloProfit"></div></div>
+    </div>
+  </section>
+
+  <section>
     <h2>By department</h2>
     <div class="panel tablewrap"><table id="depts"></table></div>
   </section>
@@ -133,7 +142,7 @@ footer { margin-top: 50px; font-size: 13.5px; color: var(--muted); border-top: 1
     <ul class="limits" id="limits"></ul>
   </section>
 
-  <footer>Built by Satwik Kotta · <a href="https://github.com/satwik-kotta/promo-incrementality">Code and method on GitHub</a> · Data: 84.51° Complete Journey via the open source completejourney package</footer>
+  <footer>Built by Satwik Kotta · <a href="https://github.com/satwik-kotta/promo-incrementality">Code and method on GitHub</a> · <a href="https://github.com/satwik-kotta/promo-incrementality/blob/main/MEMO.md">One page memo</a> · Data: 84.51° Complete Journey via the open source completejourney package</footer>
 </div>
 <script src="echarts.min.js"></script>
 <script src="data.js"></script>
@@ -149,7 +158,7 @@ const mailerPct = E.mailer_ad.effect_pct, elasticity = -E.log_price.Estimate;
 const backDrop = -H.came_back_deal_effect_pts / (H.came_back_full_price_non_deal * 100);
 document.getElementById("lede").textContent =
   `Across ${num(D.deals)} deals on ${num(D.products)} products, ${pct(D.subsidized_share_weighted)} of the units sold on deal would have sold at the regular price anyway. ` +
-  `Only ${pct(D.profitable_share_by_margin["30"])} of deals made money for the retailer at a 30% gross margin before manufacturer funding.`;
+  `Only ${pct(D.profitable_share_by_margin["30"])} of deals made money for the retailer at a 30% gross margin before manufacturer funding, and ${pct(P.halo.adjusted.profitable_30)} after counting extra spending on other items.`;
 document.getElementById("meta").innerHTML =
   `${num(P.data.transactions)} transactions from ${num(P.data.households)} households, weeks ${P.data.weeks}. A deal week is a week where the loyalty discount is at least ${pct(P.data.deal_threshold)} off shelf price.`;
 
@@ -276,6 +285,42 @@ chart("retention", {
   series: [{ type: "bar", barMaxWidth: 70, data: [{ value: H.came_back_full_price_non_deal, itemStyle: { color: C.base } }, { value: backDeal, itemStyle: { color: C.loss } }], label: { show: true, position: "top", formatter: p => pct(p.value, 1), color: C.ink } }],
 });
 
+// Halo
+const HF = P.halo.fit, HA = P.halo.adjusted, HL = P.halo.adjusted_low, HH = P.halo.adjusted_high;
+document.getElementById("haloNote").textContent = `Same household, week fixed effects. ${num(HF.household_weeks)} household weeks.`;
+const haloRows = [
+  { label: "Spend on other items ($)", v: HF.other_spend.per_deal, ci: HF.other_spend.ci, pv: HF.other_spend.placebo_next_week, pci: HF.other_spend.placebo_ci },
+  { label: "Store trips (x10)", v: HF.trips.per_deal * 10, ci: HF.trips.ci.map(x => x * 10), pv: HF.trips.placebo_next_week * 10, pci: HF.trips.placebo_ci.map(x => x * 10) },
+];
+chart("haloFx", {
+  grid: { left: 10, right: 20, top: 34, bottom: 10, containLabel: true },
+  legend: { top: 0, left: 0, data: ["This week's deals", "Next week's deals (placebo)"] },
+  tooltip: { trigger: "item", formatter: p => p.seriesName + ": " + (+p.value[1]).toFixed(3) },
+  xAxis: Object.assign({ type: "category", data: haloRows.map(r => r.label) }, axis),
+  yAxis: Object.assign({ type: "value", min: -0.4, max: 0.6 }, { splitLine: axis.splitLine, axisLabel: { color: C.muted } }),
+  series: [
+    { name: "This week's deals", type: "scatter", symbolSize: 12, itemStyle: { color: C.gain }, data: haloRows.map((r, i) => [i, r.v]),
+      markLine: { silent: true, symbol: "none", data: [{ yAxis: 0 }], lineStyle: { color: C.muted, type: "dashed" }, label: { show: false } } },
+    { name: "Next week's deals (placebo)", type: "scatter", symbolSize: 10, symbolOffset: [14, 0], itemStyle: { color: C.base }, data: haloRows.map((r, i) => [i, r.pv]) },
+    { type: "custom", renderItem: (p, api) => { const i = api.value(0), a = api.coord([i, api.value(1)]), b = api.coord([i, api.value(2)]), col = api.value(3) ? C.base : C.gain, off = api.value(3) ? 14 : 0;
+        return { type: "line", shape: { x1: a[0] + off, y1: a[1], x2: b[0] + off, y2: b[1] }, style: { stroke: col, lineWidth: 2 } }; },
+      data: haloRows.flatMap((r, i) => [[i, r.ci[0], r.ci[1], 0], [i, r.pci[0], r.pci[1], 1]]), z: 1, tooltip: { show: false } },
+  ],
+});
+chart("haloProfit", {
+  grid: { left: 10, right: 20, top: 34, bottom: 10, containLabel: true },
+  legend: { top: 0, left: 0, data: ["Item only", "With halo"] },
+  tooltip: { trigger: "axis", valueFormatter: v => pct(v, 1) },
+  xAxis: Object.assign({ type: "category", data: margins.map(m => m + "%"), boundaryGap: false }, axis),
+  yAxis: Object.assign({ type: "value", max: 0.8, axisLabel: { formatter: v => pct(v), color: C.muted } }, { splitLine: axis.splitLine }),
+  series: [
+    { type: "line", data: margins.map(m => HL["profitable_" + m]), lineStyle: { opacity: 0 }, symbol: "none", stack: "band", tooltip: { show: false } },
+    { type: "line", data: margins.map(m => HH["profitable_" + m] - HL["profitable_" + m]), lineStyle: { opacity: 0 }, symbol: "none", stack: "band", areaStyle: { color: "rgba(47,111,79,0.15)" }, tooltip: { show: false } },
+    { name: "With halo", type: "line", data: margins.map(m => HA["profitable_" + m]), lineStyle: { color: C.gain, width: 2.5 }, itemStyle: { color: C.gain } },
+    { name: "Item only", type: "line", data: margins.map(m => D.profitable_share_by_margin[m]), lineStyle: { color: C.ink, width: 2.5 }, itemStyle: { color: C.ink } },
+  ],
+});
+
 // Departments
 const NAMES = { "MEAT-PCKGD": "Meat (packaged)", "DRUG GM": "Drug & general merch." };
 const nice = s => NAMES[s] || s.charAt(0) + s.slice(1).toLowerCase();
@@ -289,6 +334,7 @@ const recs = [
   `<b>Stop running price cuts that are not advertised.</b> Shelf only deals need a median ${pct(shelf.break_even)} margin to break even and ${pct(shelf.subsidized)} of their units would have sold anyway. Mailer deals need ${pct(ad.break_even)}.`,
   `<b>Negotiate vendor funding before committing to a deal.</b> At a 30% margin the median deal breaks even only if the manufacturer funds about ${pct(D.funding_needed_30_median)} of the discount.`,
   `<b>Do not shorten deals on the assumption that the lift fades.</b> Weeks 2 and 3 of a deal sold about as well as week 1, so a shorter deal gives up volume without saving discount on the same buyers.`,
+  `<b>Judge deals on the whole basket, but do not expect the basket to rescue them.</b> Each deal on a household's regular item added about $${HF.other_spend.per_deal.toFixed(2)} of spending on other items that week. Counting it, ${pct(HA.profitable_30)} of deals make money at a 30% margin instead of ${pct(D.profitable_share_by_margin["30"])}, and deals as a whole still lose money.`,
   `<b>Count cannibalization in deal reviews.</b> About ${pct(D.cannibalized_units / D.incremental_units)} of the lift was taken from other products in the same category.`,
   `<b>Do not count deal buyers as new customers.</b> New buyers who found a product on deal were ${pct(backDrop)} less likely to come back at full price within 8 weeks.`,
 ];
@@ -300,7 +346,7 @@ const lims = [
   `The data covers ${num(P.data.households)} loyalty card households, not every shopper in the stores, so dollar totals are for this panel only.`,
   "Gross margins and manufacturer funding are not in the data. Margin is an assumption you can change above, and funding is reported as the share needed to break even.",
   "Deals do not line up with calendar weeks, so the week before and after a deal carry some of the deal. That is why both show small positive effects.",
-  "Cannibalization is measured within the same product category and week. Basket halo, extra store trips or loss leader traffic are not measured and could make some deals worth more.",
+  "Cannibalization is measured within the same product category and week. The halo is measured on the panel households' own spending in the same week, so longer term loyalty effects are not counted. Because spending on other items already nets out sister products losing sales, the halo adjusted profit is conservative.",
   `Results hold when the deal threshold changes. ${sens}.`,
 ];
 document.getElementById("limits").innerHTML = lims.map(l => `<li>${l}</li>`).join("");

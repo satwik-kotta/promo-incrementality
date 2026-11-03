@@ -27,6 +27,7 @@ def main() -> None:
         "data": r["data"],
         "deals": r["deals"],
         "households": r["households"],
+        "halo": r["halo"],
         "sensitivity": r["sensitivity"],
         "effects": {k: {kk: v[kk] for kk in ["effect_pct", "ci_low_pct", "ci_high_pct", "Estimate"]} for k, v in eff.items()},
         "curve": curve,

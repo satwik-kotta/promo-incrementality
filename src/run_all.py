@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import model  # noqa: E402
+import halo  # noqa: E402
 
 PROC = ROOT / "data" / "processed"
 OUT = ROOT / "outputs"
@@ -60,6 +61,19 @@ def household_checks() -> dict:
         "came_back_full_price_non_deal": base_back,
         "came_back_deal_effect_pts": float(back_fit.loc["deal", "Estimate"]) * 100,
         "came_back_deal_ci_pts": [float(back_fit.loc["deal", "2.5%"]) * 100, float(back_fit.loc["deal", "97.5%"]) * 100],
+    }
+
+
+def halo_block(ep: pd.DataFrame) -> dict:
+    hw, regulars = halo.household_weeks()
+    fit = halo.fit_halo(hw)
+    per = fit["other_spend"]["per_deal"]
+    lo, hi = fit["other_spend"]["ci"]
+    return {
+        "fit": fit,
+        "adjusted": halo.halo_adjusted(ep, regulars, per),
+        "adjusted_low": halo.halo_adjusted(ep, regulars, lo),
+        "adjusted_high": halo.halo_adjusted(ep, regulars, hi),
     }
 
 
@@ -152,6 +166,7 @@ def main() -> None:
         "effects": eff.to_dict(orient="records"),
         "deals": summarize(ep),
         "households": household_checks(),
+        "halo": halo_block(ep),
         "sensitivity": sensitivity(panel),
     }
     (OUT / "results.json").write_text(json.dumps(results, indent=2, default=float))
