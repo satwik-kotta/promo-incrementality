@@ -5,7 +5,7 @@ from pathlib import Path
 
 import duckdb
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyfixest as pf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,18 +43,18 @@ def household_checks() -> dict:
           (select count(*) from feat f where f.product_id = a.product_id
                   and f.week between a.week + 1 and a.week + 8 and f.deal = 0) as full_weeks_available
         from hp a where a.week between 15 and 44
-    """).df()
-    d["new"] = (~d["seen"]).astype(int)
-    d["back_full"] = d["back_full"].astype(int)
-    new_fit = pf.feols("new ~ deal | product_id + week", data=d, vcov={"CRV1": "product_id"}).tidy()
-    n = d[d["new"] == 1]
-    back_fit = pf.feols("back_full ~ deal + full_weeks_available | product_id + week", data=n,
+    """).pl().with_columns(pl.col(pl.Decimal).cast(pl.Float64))
+    d = d.with_columns((~pl.col("seen")).cast(pl.Int64).alias("new"), pl.col("back_full").cast(pl.Int64))
+    n = d.filter(pl.col("new") == 1)
+    # pyfixest takes pandas frames, so convert only at the model boundary.
+    new_fit = pf.feols("new ~ deal | product_id + week", data=d.to_pandas(), vcov={"CRV1": "product_id"}).tidy()
+    back_fit = pf.feols("back_full ~ deal + full_weeks_available | product_id + week", data=n.to_pandas(),
                         vcov={"CRV1": "product_id"}).tidy()
-    base_new = float(d.loc[d["deal"] == 0, "new"].mean())
-    base_back = float(n.loc[n["deal"] == 0, "back_full"].mean())
+    base_new = float(d.filter(pl.col("deal") == 0)["new"].mean())
+    base_back = float(n.filter(pl.col("deal") == 0)["back_full"].mean())
     return {
-        "purchases": int(len(d)),
-        "new_buyers_followed": int(len(n)),
+        "purchases": d.height,
+        "new_buyers_followed": n.height,
         "new_share_non_deal": base_new,
         "new_share_deal_effect_pts": float(new_fit.loc["deal", "Estimate"]) * 100,
         "new_share_deal_ci_pts": [float(new_fit.loc["deal", "2.5%"]) * 100, float(new_fit.loc["deal", "97.5%"]) * 100],
@@ -64,7 +64,7 @@ def household_checks() -> dict:
     }
 
 
-def halo_block(ep: pd.DataFrame) -> dict:
+def halo_block(ep: pl.DataFrame) -> dict:
     hw, regulars = halo.household_weeks()
     fit = halo.fit_halo(hw)
     per = fit["other_spend"]["per_deal"]
@@ -77,13 +77,21 @@ def halo_block(ep: pd.DataFrame) -> dict:
     }
 
 
-def summarize(ep: pd.DataFrame) -> dict:
-    ep = ep.dropna(subset=["shelf_price"]).copy()
-    ep["funding_needed_30"] = (-ep["profit_at_30"] / ep["discount_dollars"]).clip(lower=0)
+MARGIN_PCTS = [20, 25, 30, 35, 40]
+DEPTH_BANDS = [(0.15, 0.2, "15 to 20%"), (0.2, 0.25, "20 to 25%"), (0.25, 0.3, "25 to 30%"),
+               (0.3, 0.4, "30 to 40%"), (0.4, 1.0, "40% +")]
+
+
+def summarize(ep: pl.DataFrame) -> dict:
+    c = pl.col
+    ep = ep.drop_nulls("shelf_price").with_columns(
+        # A deal with no extra discount divides by zero. Treat that as missing, not as a number.
+        (-c("profit_at_30") / c("discount_dollars")).clip(lower_bound=0).fill_nan(None).alias("funding_needed_30")
+    )
     total_units = ep["units"].sum()
     out = {
-        "deals": int(len(ep)),
-        "products": int(ep["product_id"].nunique()),
+        "deals": ep.height,
+        "products": ep["product_id"].n_unique(),
         "deal_units": float(total_units),
         "subsidized_units": float(ep["cf_units"].sum()),
         "incremental_units": float(ep["incr_units"].sum()),
@@ -93,41 +101,44 @@ def summarize(ep: pd.DataFrame) -> dict:
         "break_even_margin_median": float(ep["break_even_margin"].median()),
         "funding_needed_30_median": float(ep["funding_needed_30"].median()),
         "discount_dollars": float(ep["discount_dollars"].sum()),
-        "profitable_share_by_margin": {str(m): float((ep[f"profit_at_{m}"] > 0).mean()) for m in [20, 25, 30, 35, 40]},
-        "profit_by_margin": {str(m): float(ep[f"profit_at_{m}"].sum()) for m in [20, 25, 30, 35, 40]},
+        "profitable_share_by_margin": {str(m): float((ep[f"profit_at_{m}"] > 0).mean()) for m in MARGIN_PCTS},
+        "profit_by_margin": {str(m): float(ep[f"profit_at_{m}"].sum()) for m in MARGIN_PCTS},
     }
 
     def group(col):
-        g = ep.groupby(col, observed=True).agg(
-            deals=("units", "size"),
-            break_even=("break_even_margin", "median"),
-            subsidized=("subsidized_share", "median"),
-            funding=("funding_needed_30", "median"),
-            profitable30=("profit_at_30", lambda s: float((s > 0).mean())),
-            profitable_by=("profit_at_20", "size"),
-        ).reset_index()
-        for m in [20, 25, 30, 35, 40]:
-            g[f"profitable_{m}"] = ep.groupby(col, observed=True)[f"profit_at_{m}"].apply(lambda s: float((s > 0).mean())).values
-        return g.drop(columns=["profitable_by"])
+        return (ep.drop_nulls(col).group_by(col).agg(
+            pl.len().alias("deals"),
+            c("break_even_margin").median().alias("break_even"),
+            c("subsidized_share").median().alias("subsidized"),
+            c("funding_needed_30").median().alias("funding"),
+            (c("profit_at_30") > 0).mean().alias("profitable30"),
+            *[(c(f"profit_at_{m}") > 0).mean().alias(f"profitable_{m}") for m in MARGIN_PCTS],
+        ).with_columns(pl.col("deals").cast(pl.Int64)))
 
-    ep["depth_band"] = pd.cut(ep["depth"], [0.15, 0.2, 0.25, 0.3, 0.4, 1.0],
-                              labels=["15 to 20%", "20 to 25%", "25 to 30%", "30 to 40%", "40% +"])
-    ep["advertised"] = np.where(ep["mailer"] == 1, "In the weekly mailer", "Shelf price cut only")
-    out["by_depth"] = group("depth_band").to_dict(orient="records")
-    out["by_mailer"] = group("advertised").to_dict(orient="records")
-    dept = group("department")
-    out["by_department"] = dept[dept["deals"] >= 50].sort_values("deals", ascending=False).to_dict(orient="records")
+    band = pl.lit(None, dtype=pl.Utf8)
+    for lo, hi, label in reversed(DEPTH_BANDS):
+        band = pl.when((c("depth") > lo) & (c("depth") <= hi)).then(pl.lit(label)).otherwise(band)
+    ep = ep.with_columns(
+        band.alias("depth_band"),
+        pl.when(c("mailer") == 1).then(pl.lit("In the weekly mailer")).otherwise(pl.lit("Shelf price cut only")).alias("advertised"),
+    )
+    order = {label: i for i, (_, _, label) in enumerate(DEPTH_BANDS)}
+    by_depth = group("depth_band").sort(c("depth_band").replace_strict(order, return_dtype=pl.Int64))
+    out["by_depth"] = by_depth.to_dicts()
+    out["by_mailer"] = group("advertised").sort("advertised").to_dicts()
+    dept = group("department").filter(c("deals") >= 50).sort(["deals", "department"], descending=[True, False])
+    out["by_department"] = dept.to_dicts()
     return out
 
 
-def sensitivity(panel: pd.DataFrame) -> list:
+def sensitivity(panel: pl.DataFrame) -> list:
     rows = []
     for thr in [0.10, 0.15, 0.20]:
         model.DEAL_THRESHOLD = thr
         df = model.prepare(panel)
         fit = model.fit(df)
         coef = dict(zip(model.effects_table(fit)["term"], model.effects_table(fit)["Estimate"]))
-        ep = model.deal_economics(df, coef).dropna(subset=["shelf_price"])
+        ep = model.deal_economics(df, coef).drop_nulls("shelf_price")
         rows.append({
             "threshold": thr,
             "elasticity": coef["log_price"],
@@ -143,27 +154,27 @@ def sensitivity(panel: pd.DataFrame) -> list:
 def main() -> None:
     OUT.mkdir(exist_ok=True)
     build_panel()
-    panel = pd.read_parquet(PROC / "panel.parquet")
+    panel = pl.read_parquet(PROC / "panel.parquet")
     df = model.prepare(panel)
     fit = model.fit(df)
     eff = model.effects_table(fit)
     coef = dict(zip(eff["term"], eff["Estimate"]))
     ep = model.deal_economics(df, coef)
-    df.to_parquet(PROC / "panel_features.parquet")
-    ep.to_parquet(PROC / "deal_episodes.parquet")
-    eff.to_csv(OUT / "lift_effects.csv", index=False)
-    ep.to_csv(OUT / "deal_episodes.csv", index=False)
+    df.write_parquet(PROC / "panel_features.parquet")
+    ep.write_parquet(PROC / "deal_episodes.parquet")
+    eff.write_csv(OUT / "lift_effects.csv")
+    ep.write_csv(OUT / "deal_episodes.csv")
 
     tx = duckdb.sql(f"select count(*) n, count(distinct household_id) hh, count(distinct basket_id) b "
-                    f"from '{ROOT}/data/raw/transactions.parquet'").df().iloc[0]
+                    f"from '{ROOT}/data/raw/transactions.parquet'").pl().row(0, named=True)
     results = {
         "data": {
             "transactions": int(tx["n"]), "households": int(tx["hh"]), "baskets": int(tx["b"]),
-            "products_in_scope": int(df["product_id"].nunique()), "weeks": "2 to 52 of 2017",
-            "product_weeks": int(len(df)), "deal_week_share": float(df["deal"].mean()),
+            "products_in_scope": df["product_id"].n_unique(), "weeks": "2 to 52 of 2017",
+            "product_weeks": df.height, "deal_week_share": float(df["deal"].mean()),
             "deal_threshold": model.DEAL_THRESHOLD,
         },
-        "effects": eff.to_dict(orient="records"),
+        "effects": eff.to_dicts(),
         "deals": summarize(ep),
         "households": household_checks(),
         "halo": halo_block(ep),

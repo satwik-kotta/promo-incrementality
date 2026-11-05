@@ -10,8 +10,7 @@ deal is the halo. Next week's deals are included as a placebo: they should have 
 from pathlib import Path
 
 import duckdb
-import numpy as np
-import pandas as pd
+import polars as pl
 import pyfixest as pf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +18,7 @@ PROC = ROOT / "data" / "processed"
 MARGINS = [20, 25, 30, 35, 40]
 
 
-def household_weeks() -> tuple[pd.DataFrame, pd.DataFrame]:
+def household_weeks() -> tuple[pl.DataFrame, pl.DataFrame]:
     con = duckdb.connect()
     con.sql(f"create view tx as select * from '{ROOT}/data/raw/transactions.parquet' where week between 2 and 52")
     con.sql(f"create view deal as select product_id, week, deal from '{PROC}/panel_features.parquet'")
@@ -49,16 +48,17 @@ def household_weeks() -> tuple[pd.DataFrame, pd.DataFrame]:
                coalesce(h.trips, 0) as trips, coalesce(h.spend, 0) as spend,
                coalesce(h.deal_spend, 0) as deal_spend, coalesce(h.other_spend, 0) as other_spend
         from expo e left join hw h using (household_id, week)
-    """).df()
-    regulars = con.sql("select product_id, count(*) as regular_households from reg group by 1").df()
+    """).pl().with_columns(pl.col(pl.Decimal).cast(pl.Float64))  # DuckDB sums arrive as decimals
+    regulars = con.sql("select product_id, count(*) as regular_households from reg group by 1").pl()
     return df, regulars
 
 
-def fit_halo(df: pd.DataFrame) -> dict:
+def fit_halo(df: pl.DataFrame) -> dict:
     out = {}
-    d = df.dropna(subset=["n_deal_next"])
+    d = df.drop_nulls("n_deal_next")
+    dp = d.to_pandas()  # pyfixest takes a pandas frame
     for y in ["trips", "other_spend", "deal_spend", "spend"]:
-        t = pf.feols(f"{y} ~ n_deal + n_deal_next | household_id + week", data=d,
+        t = pf.feols(f"{y} ~ n_deal + n_deal_next | household_id + week", data=dp,
                      vcov={"CRV1": "household_id"}).tidy()
         out[y] = {
             "per_deal": float(t.loc["n_deal", "Estimate"]),
@@ -67,16 +67,17 @@ def fit_halo(df: pd.DataFrame) -> dict:
             "placebo_ci": [float(t.loc["n_deal_next", "2.5%"]), float(t.loc["n_deal_next", "97.5%"])],
             "mean": float(d[y].mean()),
         }
-    out["household_weeks"] = int(len(d))
-    out["households"] = int(d["household_id"].nunique())
+    out["household_weeks"] = d.height
+    out["households"] = d["household_id"].n_unique()
     return out
 
 
-def halo_adjusted(episodes: pd.DataFrame, regulars: pd.DataFrame, other_spend_per_deal: float) -> dict:
+def halo_adjusted(episodes: pl.DataFrame, regulars: pl.DataFrame, other_spend_per_deal: float) -> dict:
     """Add the margin on halo spending to each deal, per week the deal runs."""
-    ep = episodes.dropna(subset=["shelf_price"]).merge(regulars, on="product_id", how="left")
-    ep["regular_households"] = ep["regular_households"].fillna(0)
-    ep["halo_spend"] = other_spend_per_deal * ep["regular_households"] * ep["weeks"]
+    ep = (episodes.drop_nulls("shelf_price")
+          .join(regulars, on="product_id", how="left", maintain_order="left")
+          .with_columns(pl.col("regular_households").fill_null(0)))
+    ep = ep.with_columns((other_spend_per_deal * pl.col("regular_households") * pl.col("weeks")).alias("halo_spend"))
     res = {"halo_spend_total": float(ep["halo_spend"].sum())}
     for m in MARGINS:
         adj = ep[f"profit_at_{m}"] + (m / 100) * ep["halo_spend"]
@@ -89,5 +90,5 @@ if __name__ == "__main__":
     df, regulars = household_weeks()
     h = fit_halo(df)
     print(h)
-    ep = pd.read_parquet(PROC / "deal_episodes.parquet")
+    ep = pl.read_parquet(PROC / "deal_episodes.parquet")
     print(halo_adjusted(ep, regulars, h["other_spend"]["per_deal"]))

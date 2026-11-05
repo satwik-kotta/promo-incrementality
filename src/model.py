@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyfixest as pf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,126 +26,128 @@ FORMULA = ("units ~ log_price + mailer_ad + display + sibling_promo_share + deal
 MARGINS = [0.20, 0.25, 0.30, 0.35, 0.40]
 
 
-def prepare(panel: pd.DataFrame) -> pd.DataFrame:
+def prepare(panel: pl.DataFrame) -> pl.DataFrame:
     from features import add_episode_features, add_sibling_promo
 
-    p = panel.copy()
-    p["mailer_ad"] = p["mailer"]
-    p["depth"] = np.where(p["gross_revenue"] > 0, p["loyalty_discount"] / p["gross_revenue"], np.nan)
+    p = panel.with_columns(
+        pl.col("mailer").alias("mailer_ad"),
+        pl.when(pl.col("gross_revenue") > 0)
+        .then(pl.col("loyalty_discount") / pl.col("gross_revenue")).alias("depth"),
+    )
     # Weeks with no sales have no observed price. Fill with the product's typical depth for that ad state.
-    typical_off = p[p["mailer_ad"] == 0].groupby("product_id")["depth"].median()
-    typical_ad = p[p["mailer_ad"] == 1].groupby("product_id")["depth"].mean()
-    fill = np.where(p["mailer_ad"] == 1, p["product_id"].map(typical_ad), p["product_id"].map(typical_off))
-    p["depth_obs"] = p["depth"].notna()
-    p["depth"] = p["depth"].fillna(pd.Series(fill, index=p.index)).fillna(0).clip(0, 0.9)
-    p["log_price"] = np.log(1 - p["depth"])
-    # Episode code works on a 0/1 column named mailer, so point it at the deal flag.
-    p["mailer"] = (p["depth"] >= DEAL_THRESHOLD).astype(int)
+    typical_off = p.filter(pl.col("mailer_ad") == 0).group_by("product_id").agg(pl.col("depth").median().alias("_off"))
+    typical_ad = p.filter(pl.col("mailer_ad") == 1).group_by("product_id").agg(pl.col("depth").mean().alias("_ad"))
+    p = (p.join(typical_off, on="product_id", how="left", maintain_order="left")
+          .join(typical_ad, on="product_id", how="left", maintain_order="left"))
+    fill = pl.when(pl.col("mailer_ad") == 1).then(pl.col("_ad")).otherwise(pl.col("_off"))
+    p = p.with_columns(
+        pl.col("depth").is_not_null().alias("depth_obs"),
+        pl.coalesce(pl.col("depth"), fill, pl.lit(0.0)).clip(0, 0.9).alias("depth"),
+    ).drop("_off", "_ad")
+    p = p.with_columns(
+        (1 - pl.col("depth")).log().alias("log_price"),
+        # Episode code works on a 0/1 column named mailer, so point it at the deal flag.
+        (pl.col("depth") >= DEAL_THRESHOLD).cast(pl.Int64).alias("mailer"),
+    )
     df = add_sibling_promo(add_episode_features(p))
-    df = df.rename(columns={"mailer": "deal", "promo_w2": "deal_w2", "promo_w3plus": "deal_w3plus"})
-    df["sibling_promo_share"] = (
-        df.groupby(["product_category", "week"])["deal"].transform("sum") - df["deal"]
-    ) / (df["n_in_category"] - 1).clip(lower=1)
+    df = df.rename({"mailer": "deal", "promo_w2": "deal_w2", "promo_w3plus": "deal_w3plus"})
+    df = df.with_columns(
+        ((pl.col("deal").sum().over(["product_category", "week"]) - pl.col("deal"))
+         / (pl.col("n_in_category") - 1).clip(lower_bound=1)).alias("sibling_promo_share")
+    )
     # Regular (non deal) depth and shelf price for each product.
-    base = df[df["deal"] == 0]
-    df["base_depth"] = df["product_id"].map(base.groupby("product_id")["depth"].median()).fillna(0)
-    shelf = (base["gross_revenue"] / base["units"].where(base["units"] > 0)).groupby(base["product_id"]).median()
-    df["shelf_price"] = df["product_id"].map(shelf)
-    return df
+    base = df.filter(pl.col("deal") == 0).group_by("product_id").agg(
+        pl.col("depth").median().alias("base_depth"),
+        pl.when(pl.col("units") > 0).then(pl.col("gross_revenue") / pl.col("units")).median().alias("shelf_price"),
+    )
+    df = df.join(base, on="product_id", how="left", maintain_order="left")
+    return df.with_columns(pl.col("base_depth").fill_null(0.0))
 
 
-def fit(df: pd.DataFrame):
-    return pf.fepois(FORMULA, data=df, vcov={"CRV1": "product_id"})
+def fit(df: pl.DataFrame):
+    # pyfixest takes a pandas frame, so convert only at the model boundary.
+    return pf.fepois(FORMULA, data=df.to_pandas(), vcov={"CRV1": "product_id"})
 
 
-def effects_table(model) -> pd.DataFrame:
-    t = model.tidy().reset_index().rename(columns={"Coefficient": "term"})
-    t["effect_pct"] = (np.exp(t["Estimate"]) - 1) * 100
-    t["ci_low_pct"] = (np.exp(t["2.5%"]) - 1) * 100
-    t["ci_high_pct"] = (np.exp(t["97.5%"]) - 1) * 100
-    return t[["term", "Estimate", "Std. Error", "Pr(>|t|)", "effect_pct", "ci_low_pct", "ci_high_pct"]]
+def effects_table(model) -> pl.DataFrame:
+    t = pl.from_pandas(model.tidy().reset_index()).rename({"Coefficient": "term"})
+    pct = lambda c: ((pl.col(c).exp() - 1) * 100)  # noqa: E731
+    return t.with_columns(
+        pct("Estimate").alias("effect_pct"), pct("2.5%").alias("ci_low_pct"), pct("97.5%").alias("ci_high_pct"),
+    ).select(["term", "Estimate", "Std. Error", "Pr(>|t|)", "effect_pct", "ci_low_pct", "ci_high_pct"])
 
 
-def deal_economics(df: pd.DataFrame, coef: dict) -> pd.DataFrame:
+def deal_economics(df: pl.DataFrame, coef: dict) -> pl.DataFrame:
     """Cost each deal episode. Returns one row per episode."""
-    d = df[df["deal"] == 1].copy()
+    c = pl.col
+    regular_price = c("shelf_price") * (1 - c("base_depth"))
     # Log change in expected units caused by the deal itself, against the same week at regular price.
-    lift_log = (coef["log_price"] * (d["log_price"] - np.log(1 - d["base_depth"]))
-                + coef["mailer_ad"] * d["mailer_ad"]
-                + coef["deal_w2"] * d["deal_w2"] + coef["deal_w3plus"] * d["deal_w3plus"])
-    d["cf_units"] = d["units"] * np.exp(-lift_log)
-    d["incr_units"] = d["units"] - d["cf_units"]
-    d["net_rev"] = d["gross_revenue"] - d["loyalty_discount"]
-    d["cf_net_rev"] = d["cf_units"] * d["shelf_price"] * (1 - d["base_depth"])
+    lift_log = (coef["log_price"] * (c("log_price") - (1 - c("base_depth")).log())
+                + coef["mailer_ad"] * c("mailer_ad")
+                + coef["deal_w2"] * c("deal_w2") + coef["deal_w3plus"] * c("deal_w3plus"))
+    d = df.filter(c("deal") == 1).with_columns((c("units") * (-lift_log).exp()).alias("cf_units"))
+    d = d.with_columns(
+        (c("units") - c("cf_units")).alias("incr_units"),
+        (c("gross_revenue") - c("loyalty_discount")).alias("net_rev"),
+        (c("cf_units") * regular_price).alias("cf_net_rev"),
+    )
 
     # Cannibalization: units this deal took from other products in the same category that week.
-    others = df[["product_id", "product_category", "week", "units", "n_in_category", "shelf_price", "base_depth"]]
-    cat_week = others.groupby(["product_category", "week"]).agg(
-        cat_units=("units", "sum"),
-        cat_rev=("units", lambda s: 0.0),
+    cat_week = df.group_by(["product_category", "week"]).agg(
+        c("units").sum().alias("cat_units"),
+        (c("units") * regular_price).sum().alias("cat_net_rev_regular"),
     )
-    rev = (others["units"] * others["shelf_price"] * (1 - others["base_depth"])).groupby(
-        [others["product_category"], others["week"]]).sum()
-    cat_week["cat_net_rev_regular"] = rev
-    d = d.join(cat_week, on=["product_category", "week"])
-    share_one = 1 / (d["n_in_category"] - 1).clip(lower=1)
-    lost_frac = 1 - np.exp(coef["sibling_promo_share"] * share_one)
-    other_units = d["cat_units"] - d["units"]
-    other_rev = d["cat_net_rev_regular"] - d["units"] * d["shelf_price"] * (1 - d["base_depth"])
-    d["cannibal_units"] = (other_units * lost_frac).clip(lower=0)
-    d["cannibal_rev"] = (other_rev * lost_frac).clip(lower=0)
+    d = d.join(cat_week, on=["product_category", "week"], how="left", maintain_order="left")
+    lost_frac = 1 - (coef["sibling_promo_share"] / (c("n_in_category") - 1).clip(lower_bound=1)).exp()
+    d = d.with_columns(
+        ((c("cat_units") - c("units")) * lost_frac).clip(lower_bound=0).alias("cannibal_units"),
+        ((c("cat_net_rev_regular") - c("units") * regular_price) * lost_frac).clip(lower_bound=0).alias("cannibal_rev"),
+    )
 
-    ep = d.groupby(["product_id", "episode_id"]).agg(
-        department=("department", "first"),
-        product_category=("product_category", "first"),
-        weeks=("week", "count"),
-        start_week=("week", "min"),
-        mailer=("mailer_ad", "max"),
-        depth=("depth", "mean"),
-        base_depth=("base_depth", "first"),
-        shelf_price=("shelf_price", "first"),
-        units=("units", "sum"),
-        cf_units=("cf_units", "sum"),
-        incr_units=("incr_units", "sum"),
-        net_rev=("net_rev", "sum"),
-        cf_net_rev=("cf_net_rev", "sum"),
-        cannibal_units=("cannibal_units", "sum"),
-        cannibal_rev=("cannibal_rev", "sum"),
-    ).reset_index()
+    ep = d.group_by(["product_id", "episode_id"]).agg(
+        c("department").drop_nulls().first(),
+        c("product_category").drop_nulls().first(),
+        c("week").count().alias("weeks"),
+        c("week").min().alias("start_week"),
+        c("mailer_ad").max().alias("mailer"),
+        c("depth").mean(),
+        c("base_depth").drop_nulls().first(),
+        c("shelf_price").drop_nulls().first(),
+        *[c(x).sum() for x in ["units", "cf_units", "incr_units", "net_rev", "cf_net_rev",
+                               "cannibal_units", "cannibal_rev"]],
+    ).sort(["product_id", "episode_id"])
     # Profit change at gross margin m (margin on the regular shelf price):
     #   unit cost c = (1 - m) * shelf price
     #   own change   = (net_rev - c * units) - (cf_net_rev - c * cf_units)
     #   cannibal     = m_net * cannibal_rev, using the same margin on the regular net price
     # Break even margin solves own change - cannibal = 0, which is linear in m.
-    p = ep["shelf_price"]
-    a = ep["net_rev"] - ep["cf_net_rev"] - p * (ep["units"] - ep["cf_units"])
-    b = p * (ep["units"] - ep["cf_units"])
-    # profit(m) = a + m * b - cannibal_margin(m); cannibal margin ~ m * cannibal_rev
-    slope = b - ep["cannibal_rev"]
-    ep["break_even_margin"] = np.where(slope > 0, -a / slope, np.nan)
-    for m in MARGINS:
-        ep[f"profit_at_{int(m * 100)}"] = a + m * slope
-    ep["subsidized_share"] = ep["cf_units"] / ep["units"].where(ep["units"] > 0)
-    ep["discount_dollars"] = (ep["depth"] - ep["base_depth"]).clip(lower=0) * p * ep["units"]
-    return ep
+    p = c("shelf_price")
+    a = c("net_rev") - c("cf_net_rev") - p * (c("units") - c("cf_units"))
+    slope = p * (c("units") - c("cf_units")) - c("cannibal_rev")
+    return ep.with_columns(
+        pl.when(slope > 0).then(-a / slope).alias("break_even_margin"),
+        *[(a + m * slope).alias(f"profit_at_{int(m * 100)}") for m in MARGINS],
+        pl.when(c("units") > 0).then(c("cf_units") / c("units")).alias("subsidized_share"),
+        ((c("depth") - c("base_depth")).clip(lower_bound=0) * p * c("units")).alias("discount_dollars"),
+    )
 
 
 def main() -> None:
     import sys
     sys.path.insert(0, str(ROOT / "src"))
     OUT.mkdir(exist_ok=True)
-    panel = pd.read_parquet(PROC / "panel.parquet")
+    panel = pl.read_parquet(PROC / "panel.parquet")
     df = prepare(panel)
     model = fit(df)
     eff = effects_table(model)
     coef = dict(zip(eff["term"], eff["Estimate"]))
     ep = deal_economics(df, coef)
-    df.to_parquet(PROC / "panel_features.parquet")
-    ep.to_parquet(PROC / "deal_episodes.parquet")
-    eff.to_csv(OUT / "lift_effects.csv", index=False)
-    ep.to_csv(OUT / "deal_episodes.csv", index=False)
-    print(eff.round(3).to_string())
-    print(ep.describe().T.round(3).to_string())
+    df.write_parquet(PROC / "panel_features.parquet")
+    ep.write_parquet(PROC / "deal_episodes.parquet")
+    eff.write_csv(OUT / "lift_effects.csv")
+    ep.write_csv(OUT / "deal_episodes.csv")
+    print(eff)
+    print(ep.describe())
 
 
 if __name__ == "__main__":

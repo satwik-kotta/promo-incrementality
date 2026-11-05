@@ -85,12 +85,12 @@ make all        # download data, build the panel, fit the model, write outputs a
 make test
 ```
 
-Takes about 15 seconds after the download.
+Takes about 15 seconds after the download. SQL runs in DuckDB and all data wrangling is in polars. pandas is used only to hand data to pyfixest and to read the original R files.
 
 ```
 sql/01_panel.sql         product x week panel
 src/get_data.py          download the Complete Journey tables
-src/features.py          deal episodes, weeks before and after, category deal share
+src/features.py          deal episodes, weeks before and after, category deal share (polars)
 src/model.py             lift model, counterfactual, deal profit and break even margin
 src/halo.py              basket halo and halo adjusted deal profit
 src/run_all.py           pipeline, household checks, halo, robustness, outputs/results.json
